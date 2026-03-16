@@ -1,0 +1,114 @@
+import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  try {
+    const session = await getServerSession(authOptions);
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const userId = (session.user as any).id;
+    const userRole = (session.user as any).role;
+    const isAdmin = userRole === "ADMIN" || userRole === "admin" || userRole === "SUPERADMIN";
+
+    // Fetch user's quota limit
+    const user = await (prisma.user as any).findUnique({
+      where: { id: userId },
+      select: { maxProjects: true }
+    });
+    const maxProjects = (user as any)?.maxProjects ?? 6;
+
+    const services = await prisma.projectService.findMany({
+      take: 500, // [PERFORMANCE] Safety bound for admin view scale
+      where: {
+        group: {
+          // [BUGFIX] My Services page should strictly show only the logged-in user's services.
+          // Even if they are an ADMIN, they should only see *their own* projects here.
+          // Global viewing belongs in the /admin scope.
+          userId: userId,
+          isActive: true,
+        },
+      },
+      include: {
+        group: {
+          select: {
+            repoUrl: true,
+            groupName: true,
+          },
+        },
+        scans: {
+          take: 1,
+          orderBy: { startedAt: "desc" },
+          where: {
+            status: {
+              in: [
+                "QUEUED",
+                "RUNNING",
+                "SCANNED",
+                "SUCCESS",
+                "PASSED",
+                "FAILED",
+                "FAILED_SECURITY",
+                "BLOCKED",
+              ],
+            },
+          },
+          select: {
+            id: true,
+            pipelineId: true,
+            status: true,
+            imageTag: true,
+            vulnCritical: true,
+            vulnHigh: true,
+            vulnMedium: true,
+            vulnLow: true,
+            scanMode: true,
+            startedAt: true,
+            imagePushed: true, // [NEW] Fetch imagePushed status
+          },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+
+    // Transform data
+    const transformedServices = services.map((service) => ({
+      id: service.id,
+      serviceName: service.serviceName,
+      imageName: service.imageName,
+      repoUrl: service.group.repoUrl, // ดึง repoUrl มาจาก Group
+      contextPath: service.contextPath,
+      createdAt: service.createdAt,
+      _count: {
+        scans: 1, // หรือจะ query count จริงๆ ก็ได้ถ้าต้องการความแม่นยำ
+      },
+      scans: service.scans.map((scan) => ({
+        id: scan.id,
+        pipelineId: scan.pipelineId || "",
+        status: scan.status,
+        scanMode: scan.scanMode,
+        imageTag: scan.imageTag,
+        vulnCritical: Number(scan.vulnCritical) || 0,
+        vulnHigh: Number(scan.vulnHigh) || 0,
+        vulnMedium: Number(scan.vulnMedium) || 0,
+        vulnLow: Number(scan.vulnLow) || 0,
+        completedAt: scan.startedAt?.toISOString() || new Date().toISOString(),
+        imagePushed: scan.imagePushed, // [NEW] Include in response
+      })),
+    }));
+
+    return NextResponse.json({ services: transformedServices, maxProjects });
+  } catch (error) {
+    console.error("Failed to fetch services:", error);
+    return NextResponse.json(
+      { error: "Failed to fetch services" },
+      { status: 500 }
+    );
+  }
+}

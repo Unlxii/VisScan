@@ -1,0 +1,449 @@
+"use client";
+
+import React, { useEffect, useState, useCallback, useMemo } from "react";
+import { Loader2, AlertCircle, XCircle, GitCompare } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { mutate } from "swr";
+import { v4 as uuidv4 } from "uuid";
+
+import PipelineStepper from "@/components/PipelineStepper"; // [NEW]
+import ConfirmBuildButton from "./ReleaseButton";
+import { Run, ComparisonData, Vulnerability } from "./pipeline/types";
+import { QueuedState, CancelledState } from "./pipeline/StatusViews";
+import { StatusHeader } from "./pipeline/StatusHeader";
+import { SummaryCards } from "./pipeline/SummaryCards";
+import { LogsPanel } from "./pipeline/LogsPanel";
+import { HealthyStateBanner } from "./pipeline/HealthyStateBanner";
+import { ComparisonSection } from "./pipeline/ComparisonSection";
+import { CriticalVulnerabilitiesBlock } from "./pipeline/CriticalVulnerabilitiesBlock";
+import { FindingsTable } from "./pipeline/FindingsTable";
+
+export default function PipelineView(props: {
+  scanId: string;
+  scanMode?: string;
+  initialData?: any;
+}) {
+  const { scanId, scanMode, initialData } = props;
+  const router = useRouter();
+  const [run, setRun] = useState<Run | null>(initialData || null); // Initialize with server data
+  const [comparison, setComparison] = useState<ComparisonData | null>(null);
+  const [isLoading, setIsLoading] = useState(!initialData); // Don't load if we have data
+  const [error, setError] = useState<string | null>(null);
+  const [isCancelling, setIsCancelling] = useState(false);
+  const [showCompareButton, setShowCompareButton] = useState(false);
+
+  // Helper to fetch comparison data
+  const fetchComparison = useCallback(async (serviceId: string) => {
+    try {
+      const res = await fetch(`/api/scan/compare/${serviceId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setComparison(data);
+      }
+    } catch (err) {
+      console.error("Failed to fetch comparison:", err);
+    }
+  }, []);
+
+  //  1. ฟังก์ชันโหลดข้อมูลปกติ (Load Local Data)
+  const fetchStatus = useCallback(async () => {
+    try {
+      if (!scanId) return;
+      const res = await fetch(`/api/scan/${scanId}?_t=${Date.now()}`, {
+        headers: { "Cache-Control": "no-store" },
+        cache: "no-store",
+      });
+
+      if (res.status === 404) {
+        const errorData = await res.json();
+        setError(errorData.details || "Pipeline not found");
+        setIsLoading(false);
+        return;
+      }
+
+      if (!res.ok) return;
+
+      const data = await res.json();
+      setRun(data);
+      setError(null);
+      setIsLoading(false);
+
+      if (
+        data.serviceId &&
+        (data.status === "SUCCESS" ||
+          data.status === "FAILED_SECURITY" ||
+          data.status === "BLOCKED")
+      ) {
+        fetchComparison(data.serviceId);
+      }
+    } catch (e) {
+      console.error("Polling Error:", e);
+    }
+  }, [scanId, fetchComparison]);
+
+  //  2. ฟังก์ชัน Auto-Sync (เรียก API POST เพื่อดึงจาก GitLab)
+  const autoSyncGitLab = useCallback(async () => {
+    try {
+      // เรียก API ที่เราเพิ่งรวมไฟล์ไป (POST /api/scan/[id])
+      // เพื่อสั่งให้ Backend ไปถาม GitLab เดี๋ยวนี้
+      await fetch(`/api/scan/${scanId}`, { method: "POST" });
+
+      // พอถามเสร็จ ก็โหลดข้อมูลล่าสุดมาโชว์
+      await fetchStatus();
+    } catch (e) {
+      console.error("Auto-sync failed:", e);
+    }
+  }, [scanId, fetchStatus]);
+
+  //  3. The "Automator" Effect (หัวใจสำคัญ)
+  useEffect(() => {
+    // โหลดครั้งแรกทันทีที่เข้าหน้า
+    fetchStatus();
+
+    // ตั้งเวลาทำงานทุกๆ 3 วินาที
+    const interval = setInterval(() => {
+      const status = run?.status?.toUpperCase();
+
+      // เช็คว่าจบงานหรือยัง?
+      const isFinalState =
+        status === "SUCCESS" ||
+        status === "FAILED" ||
+        status === "BLOCKED" ||
+        status === "CANCELED" ||
+        status === "CANCELLED" ||
+        status === "SKIPPED" ||
+        status === "FAILED_SECURITY";
+
+      if (!isFinalState) {
+        // ถ้ายังไม่จบ -> สั่ง Sync อัตโนมัติ
+        autoSyncGitLab();
+      } else {
+        // ถ้าจบแล้ว -> หยุดเรียก (เพื่อประหยัดทรัพยากร)
+        // แต่ยังเรียก fetchStatus ธรรมดาเผื่อมีการอัปเดตหน้าจออื่น
+        fetchStatus();
+      }
+    }, 3000);
+
+    // Clear timer เมื่อออกจากหน้า
+    return () => clearInterval(interval);
+  }, [fetchStatus, autoSyncGitLab, run?.status]);
+
+  // Check for compare intent
+  useEffect(() => {
+    const status = run?.status;
+    if (
+      status === "SUCCESS" ||
+      status === "PASSED" ||
+      status === "BLOCKED" ||
+      status === "FAILED_SECURITY"
+    ) {
+      const compareIntent = sessionStorage.getItem(
+        `compare_after_scan_${scanId}`,
+      );
+      if (compareIntent && run?.serviceId) {
+        setShowCompareButton(true);
+      }
+    }
+  }, [run?.status, scanId, run?.serviceId]);
+
+  // Extract findings safely
+  const extractedFindings: Vulnerability[] = useMemo(() => {
+    if (!run) return [];
+    let allFindings = run.findings || [];
+    
+    // If no compiled findings exist, try to parse from rawReports 
+    // This happens when the worker poller saves raw reports but doesn't re-compile details.findings
+    if (allFindings.length === 0 && run.rawReports) {
+      if (run.rawReports.trivy?.Results) {
+        run.rawReports.trivy.Results.forEach((result: any) => {
+           if (result.Vulnerabilities) {
+              result.Vulnerabilities.forEach((v: any) => {
+                 allFindings.push({
+                   id: v.VulnerabilityID || uuidv4(),
+                   title: v.Title || v.VulnerabilityID,
+                   description: v.Description,
+                   severity: v.Severity ? v.Severity.toLowerCase() : "unknown",
+                   pkgName: v.PkgName || "Unknown Package",
+                   installedVersion: v.InstalledVersion,
+                   fixedVersion: v.FixedVersion,
+                   sourceTool: "Trivy"
+                 });
+              });
+           }
+        });
+      }
+      if (run.rawReports.semgrep?.results) {
+         run.rawReports.semgrep.results.forEach((issue: any) => {
+            allFindings.push({
+              id: issue.check_id || uuidv4(),
+              title: issue.extra?.message || issue.check_id,
+              severity: issue.extra?.severity?.toLowerCase() || "unknown",
+              pkgName: issue.path || "Unknown File",
+              installedVersion: "",
+              sourceTool: "Semgrep"
+            });
+         });
+      }
+      if (Array.isArray(run.rawReports.gitleaks)) {
+         run.rawReports.gitleaks.forEach((secret: any) => {
+            allFindings.push({
+              id: secret.RuleID || uuidv4(),
+              title: secret.Description || "Leaked Secret",
+              severity: "critical", // Gitleaks are always critical
+              pkgName: secret.File || "Unknown File",
+              installedVersion: "",
+              sourceTool: "Gitleaks",
+              author: secret.Author,
+              email: secret.Email
+            });
+         });
+      }
+    }
+    return allFindings;
+  }, [run]);
+
+  const handleDownload = (reportName: string, data: any) => {
+    if (!data) return alert("Report not available");
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/json",
+    });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${reportName}-report.json`;
+    link.click();
+  };
+
+  const handleViewComparison = () => {
+    if (run?.serviceId) {
+      sessionStorage.removeItem(`compare_after_scan_${scanId}`);
+      router.push(`/scan/compare?serviceId=${run.serviceId}`);
+    }
+  };
+
+  const handleCancelScan = async () => {
+    if (!confirm("Are you sure you want to cancel this scan?")) return;
+    setIsCancelling(true);
+    try {
+      const res = await fetch(`/api/scan/cancel/${scanId}`, { method: "POST" });
+      if (!res.ok) throw new Error("Failed to cancel scan");
+      await autoSyncGitLab(); // Sync ทันทีหลังกดยกเลิก
+      // Force refresh dashboard and active scans
+      mutate("/api/dashboard");
+      mutate("/api/scan/status/active");
+    } catch (err: any) {
+      console.error("Cancel error:", err);
+      alert(err.message || "Failed to cancel scan");
+    } finally {
+      setIsCancelling(false);
+    }
+  };
+
+  //  New Rescan Handler for Cancelled/Failed State
+  const handleRestartScan = async () => {
+    if (!run?.serviceId) return;
+    setIsLoading(true); // Show loading temporarily
+    try {
+         const res = await fetch("/api/scan/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+               serviceId: run.serviceId,
+               scanMode: run.scanMode || "SCAN_AND_BUILD",
+               imageTag: run.imageTag || "latest",
+               force: true
+            }),
+         });
+         
+         const data = await res.json();
+         if (res.ok && data.scanId) {
+             // Redirect to new scan
+             router.push(`/scan/${data.scanId}`);
+         } else {
+             alert(data.error || "Failed to restart scan");
+             setIsLoading(false);
+         }
+    } catch (e) {
+        console.error("Restart error:", e);
+        setIsLoading(false);
+    }
+  };
+
+  // --- RENDER STATES ---
+
+  if (isLoading && !run) {
+    return (
+      <div className="flex flex-col items-center justify-center p-12 min-h-[50vh]">
+        <Loader2 className="w-10 h-10 animate-spin text-blue-600 mb-4" />
+        <h3 className="text-lg font-medium text-gray-700 dark:text-slate-300">
+          Connecting to Pipeline...
+        </h3>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="bg-red-50 dark:bg-red-900/10 border border-red-200 dark:border-red-800/30 rounded-lg p-6 m-6">
+        <div className="flex items-start gap-3">
+          <AlertCircle className="w-6 h-6 text-red-600 dark:text-red-400 flex-shrink-0 mt-0.5" />
+          <div>
+            <h3 className="text-lg font-semibold text-red-900 dark:text-red-300 mb-1">
+              Pipeline Not Found
+            </h3>
+            <p className="text-red-700 dark:text-red-400 mb-3">{error}</p>
+            <button
+              onClick={() => router.push("/dashboard")}
+              className="text-sm font-medium text-red-700 dark:text-red-400 hover:text-red-900 dark:hover:text-red-300 underline"
+            >
+              Return to Dashboard
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!run) return null;
+
+  const isQueued =
+    run.status === "QUEUED" ||
+    run.status === "PENDING" ||
+    (run as any).isQueued;
+  const isScanning = run.status === "RUNNING" || run.status === "PROCESSING";
+  const isBlocked = run.status === "BLOCKED";
+  const isSuccess = run.status === "SUCCESS";
+  const isCancelled = run.status === "CANCELLED" || run.status === "CANCELED";
+  const isCancellable = isQueued || isScanning;
+  const isScanOnly = scanMode === "SCAN_ONLY" || run.scanMode === "SCAN_ONLY";
+
+  const totalFindings =
+    run.counts.critical + run.counts.high + run.counts.medium + run.counts.low || extractedFindings.length;
+           
+  const gitleaksCount = Array.isArray(run.rawReports?.gitleaks)
+    ? run.rawReports.gitleaks.length
+    : 0;
+  const isHealthy = isSuccess && totalFindings === 0 && gitleaksCount === 0;
+
+  if (isQueued) {
+    return (
+      <QueuedState onCancel={handleCancelScan} isCancelling={isCancelling} />
+    );
+  }
+
+  if (isCancelled) {
+    return <CancelledState scanId={scanId} onRescan={handleRestartScan} />;
+  }
+
+  return (
+    <div className="max-w-6xl mx-auto p-4 md:p-6 space-y-6 font-sans animate-in fade-in duration-500">
+      {/* [moved] Pipeline Stepper (Real-time) */}
+      {run && (
+        <PipelineStepper 
+             jobs={(run as any).pipelineJobs || []} 
+             status={
+                run.status === "SUCCESS" && 
+                ((run.counts?.critical > 0) || (run.counts?.high > 0))
+                  ? "FAILED_SECURITY" 
+                  : run.status
+             } 
+             scanMode={run.scanMode || scanMode || "SCAN_AND_BUILD"} 
+             imagePushed={(run as any).imagePushed}
+             counts={run.counts}
+        />
+      )}
+      
+      {/* Action Bar: เหลือแค่ปุ่ม Cancel (ปุ่ม Sync หายไปแล้ว เพราะระบบทำให้เอง) */}
+      <div className="flex justify-end gap-2">
+        {isCancellable && (
+          <button
+            onClick={handleCancelScan}
+            disabled={isCancelling}
+            className="px-4 py-2 bg-white dark:bg-slate-800 border border-red-200 dark:border-red-800/30 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/10 hover:border-red-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 transition text-sm font-medium shadow-sm"
+          >
+            {isCancelling ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <XCircle className="w-4 h-4" />
+            )}
+            {isCancelling ? "Stopping..." : "Cancel Scan"}
+          </button>
+        )}
+      </div>
+
+      {showCompareButton && (
+        <div className="bg-gradient-to-r from-orange-50 to-amber-50 dark:from-orange-950/20 dark:to-amber-950/20 border border-orange-200 dark:border-orange-800/30 rounded-xl p-6 shadow-sm flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className="p-3 bg-white dark:bg-slate-800 rounded-full shadow-sm">
+              <GitCompare className="w-6 h-6 text-orange-600 dark:text-orange-400" />
+            </div>
+            <div>
+              <h3 className="font-bold text-gray-900 dark:text-white">Scan Complete</h3>
+              <p className="text-gray-600 dark:text-slate-400 text-sm">
+                Compare with previous results available
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={handleViewComparison}
+            className="px-5 py-2.5 bg-orange-600 hover:bg-orange-700 text-white rounded-lg font-medium flex items-center gap-2 transition shadow-sm"
+          >
+            <GitCompare className="w-4 h-4" />
+            Compare Results
+          </button>
+        </div>
+      )}
+
+      {/* [Removed PipelineStepper - now in ScanPage] */}
+      
+      {/* ปุ่ม Release จะโผล่มาเองอัตโนมัติเมื่อ isSuccess เป็นจริง */}
+      {!isScanOnly && (isSuccess || run.status?.toUpperCase() === "MANUAL" || run.status === "FAILED_SECURITY") && !isBlocked && (
+        <ConfirmBuildButton 
+            scanId={scanId} 
+            status={
+                run.status === "SUCCESS" && 
+                ((run.counts?.critical > 0) || (run.counts?.high > 0))
+                  ? "FAILED_SECURITY" 
+                  : run.status
+            } 
+            vulnCount={run.counts.critical} 
+            imagePushed={(run as any).imagePushed}
+            onSuccess={fetchStatus} // [NEW] Trigger refresh immediately
+        />
+      )}
+
+      {isBlocked && run.criticalVulnerabilities && (
+        <CriticalVulnerabilitiesBlock
+          vulnerabilities={run.criticalVulnerabilities}
+        />
+      )}
+
+      {/* [Removed StatusHeader - redundnat] */}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="space-y-6 lg:col-span-1">
+          {isHealthy && <HealthyStateBanner />}
+          <SummaryCards counts={run.counts} />
+          <LogsPanel
+            logs={run.logs}
+            scanLogs={run.scanLogs} // [NEW] Pass fallback logs
+            isSuccess={isSuccess}
+            totalFindings={totalFindings}
+            pipelineId={run.pipelineId}
+            scanId={scanId}
+            scanDuration={run.scanDuration}
+          />
+        </div>
+
+        <div className="lg:col-span-2 space-y-6">
+          {comparison && <ComparisonSection comparison={comparison} />}
+          <FindingsTable
+            findings={extractedFindings}
+            isScanning={isScanning}
+            isSuccess={isSuccess}
+            totalFindings={totalFindings}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,89 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+.env.local
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+/generated/prisma
+
+# PostgreSQL data
+/pgdata
+/pgdata/*
+
+# Prisma migrations
+/prisma/migrations
+/prisma/migrations/*
+
+*.DS_Store
+# Custom Exclusions for Migration
+worker.log
+lint-report.txt
+structure.txt
+sampleReport.pdf
+sampleReport.txt
+IMPLEMENTATION_SUMMARY.md
+ARCHITECTURE.md
+UPDATED_FLOW_GUIDE.md
+README_TH.md
+commits-analysis.md
+prisma.config.ts.bak
+merge-changes.txt
+*.log
+/scripts/perf-metrics.js
+
+# == Open Source View Exclusions ==
+# 1. Testing Frameworks
+/e2e/
+**/__tests__/
+jest.config.js
+jest.setup.js
+playwright.config.ts
+
+# 2. Scratch Utilities in Root
+/check-service-language.ts
+/cleanup_archived.ts
+/query-db.ts
+/query-scan.ts
+
+# 3. Exclude all helper scripts EXCEPT the critical one for Docker
+/scripts/*
+!/scripts/create-admin.ts
+
+

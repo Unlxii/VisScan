@@ -1,0 +1,21 @@
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  output: 'standalone',
+  /* config options here */
+
+  experimental: {
+    serverActions: {
+      allowedOrigins: ["10.10.184.118:3000", "localhost:3000", "10.10.184.118"],
+    },
+  },
+  async rewrites() {
+    return [
+      {
+        source: '/cmuEntraIDCallback',
+        destination: '/api/auth/callback/cmu-entraid',
+      },
+    ];
+  },
+};
+
+export default nextConfig;

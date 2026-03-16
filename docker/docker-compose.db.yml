@@ -1,0 +1,28 @@
+# docker-compose.db.yml
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: scan-db
+    restart: always
+    environment:
+      POSTGRES_USER: VisScan
+      POSTGRES_PASSWORD: VisScan1234
+      POSTGRES_DB: scandb
+    ports:
+      - "5433:5432"
+    volumes:
+      - ../pgdata:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: scan-queue
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+volumes:
+  pgdata:

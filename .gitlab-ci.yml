@@ -1,0 +1,600 @@
+stages:
+  - maintenance
+  - setup
+  - security_audit
+  - compile
+  - build_artifact
+  - container_scan
+  - release
+  - cleanup
+
+workflow:
+  # แสดงชื่อคนที่สั่งรัน (User) ใน GitLab UI
+  name: "[$SCAN_MODE] $PROJECT_NAME ($USER_TAG) by $FRONTEND_USER"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "api"
+    - if: $CI_PIPELINE_SOURCE == "pipeline"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  # --- TOOL VERSIONS ---
+  GITLEAKS_VERSION: "v8.18.4"
+  SEMGREP_VERSION: "1.100.0"
+  TRIVY_VERSION: "0.53.0"
+  KANIKO_VERSION: "v1.23.1-debug"
+  CRANE_VERSION: "debug"
+  MAVEN_VERSION: "3.9-eclipse-temurin-25"
+  GRADLE_VERSION: "8-jdk21"
+  NODE_VERSION: "20-alpine"
+  GO_VERSION: "1.22-alpine"
+  PYTHON_VERSION: "3.12-alpine"
+
+  # --- PROJECT SETTINGS ---
+  PROJECT_NAME: "${PROJECT_NAME:-scanned-project}"
+  USER_TAG: "${USER_TAG:-latest}"
+  TEMP_IMAGE_TAG: "temp-$CI_PIPELINE_ID"
+
+  # --- MODE CONFIGURATION ---
+  SCAN_MODE: "${SCAN_MODE:-SCAN_AND_BUILD}"
+  TARGET_DIR: ""
+
+  # --- WEBHOOK CONFIG ---
+  ENABLE_WEBHOOKS: "${ENABLE_WEBHOOKS:-true}"
+  WEBHOOK_TIMEOUT: "5"
+
+  # --- SCAN SETTINGS ---
+  TRIVY_SCAN_MODE: "${TRIVY_SCAN_MODE:-fast}"
+  TRIVY_CACHE_DIR: ".trivycache/"
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  GRADLE_USER_HOME: ".gradle"
+
+# 0. Nightly Maintenance (Cache Warmer)
+# ทำหน้าที่: "User คนแรกของวัน" (รันโดยระบบตามตารางเวลา)
+update_trivy_db:
+  stage: maintenance
+  image:
+    name: aquasec/trivy:$TRIVY_VERSION
+    entrypoint: [""]
+  rules:
+    # รันเฉพาะตอนตั้งเวลา (Schedule) หรือกด Manual เองเท่านั้น
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+  cache:
+    key: trivy-global-cache
+    paths: [.trivycache/]
+    # สำคัญ: โหมดนี้อนุญาตให้ "อัปเดต" แคชกลับขึ้นไปได้ (Push)
+    policy: push
+  script:
+    - echo "System Maintenance- Downloading latest Trivy DB..."
+    - mkdir -p .trivycache/
+    # สั่งดาวน์โหลด DB ใหม่ล่าสุด เก็บลงโฟลเดอร์ Cache
+    - trivy image --download-db-only --cache-dir .trivycache/
+    - echo "DB Updated. Cache will be pushed to server."
+  artifacts:
+    paths: [.trivycache/]
+    expire_in: 2 days
+
+# 1. Fetch & Detection (ALWAYS RUN)
+fetch_and_detect:
+  stage: setup
+  image:
+    name: alpine/git:2.45.2
+    entrypoint: [""]
+  retry: 2
+  script:
+    - echo "Pipeline Started... Mode:$SCAN_MODE"
+    - apk add --no-cache wget curl
+
+    # Webhook: Pipeline Started
+    - |
+      if [ "$ENABLE_WEBHOOKS" = "true" ]; then
+        wget --timeout=$WEBHOOK_TIMEOUT --spider "$BACKEND_HOST_URL/api/webhook" 2>&1 | grep -q "200\|302\|404" && \
+        wget --header="Content-Type: application/json" \
+             --post-data="{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"RUNNING\", \"mode\": \"$SCAN_MODE\", \"user\": \"$FRONTEND_USER\"}" \
+             "$BACKEND_HOST_URL/api/webhook" -O - || echo "Webhook Failed"
+      fi
+
+    # Clone
+    - rm -rf .git # ลบ Git History ของตัว Runner ทิ้งป้องกันไปปนเปื้อนใน Artifact
+    - if [ -z "$USER_REPO_URL" ]; then echo "USER_REPO_URL is missing"; exit 1; fi
+    - |
+      if [ -n "$GIT_USERNAME" ] && [ -n "$GIT_TOKEN" ]; then
+        CLEAN_URL=$(echo "$USER_REPO_URL" | sed -e 's|^https://||' -e 's|^http://||');
+        git clone "https://${GIT_USERNAME}:${GIT_TOKEN}@${CLEAN_URL}" project_temp;
+      else
+        git clone "$USER_REPO_URL" project_temp;
+      fi
+    - cp -a project_temp/. .
+    - rm -rf project_temp
+
+    # Auto-Detect Stack
+    - |
+      DETECTED_PATH="."
+      STACK="unknown"
+
+      if [ -n "$TARGET_DIR" ] && [ -d "$TARGET_DIR" ]; then
+         SEARCH_LOCATIONS="$TARGET_DIR"
+      else
+         SEARCH_LOCATIONS=". $(find . -maxdepth 2 -not -path '*/.*' -type d)"
+      fi
+
+      for loc in $SEARCH_LOCATIONS; do
+         if [ ! -d "$loc" ]; then continue; fi
+         clean_loc=$(echo "$loc" | sed 's|^\./||;s|/$||')
+         [ -z "$clean_loc" ] && clean_loc="."
+         
+         if [ -f "$clean_loc/pom.xml" ]; then STACK="java-maven"; DETECTED_PATH="$clean_loc"; break;
+         elif [ -f "$clean_loc/build.gradle" ] || [ -f "$clean_loc/build.gradle.kts" ]; then STACK="java-gradle"; DETECTED_PATH="$clean_loc"; break;
+         elif [ -f "$clean_loc/go.mod" ]; then STACK="go"; DETECTED_PATH="$clean_loc"; break;
+         elif [ -f "$clean_loc/package.json" ]; then STACK="node"; DETECTED_PATH="$clean_loc"; break;
+         elif [ -f "$clean_loc/requirements.txt" ] || [ -f "$clean_loc/pyproject.toml" ]; then STACK="python"; DETECTED_PATH="$clean_loc"; break;
+         elif [ -f "$clean_loc/Dockerfile" ]; then STACK="docker-only"; DETECTED_PATH="$clean_loc"; break;
+         fi
+      done
+
+      SAFE_PROJ=$(echo "$PROJECT_NAME" | sed 's|/|-|g' | tr '[:upper:]' '[:lower:]')
+      SAFE_CTX=$(echo "$DETECTED_PATH" | sed 's|/|-|g' | sed 's|^\.-||' | sed 's|^\.||' | tr '[:upper:]' '[:lower:]')
+      FINAL_IMAGE_NAME="docker.io/$DOCKER_USER/$SAFE_PROJ"
+      [ -n "$SAFE_CTX" ] && FINAL_IMAGE_NAME="${FINAL_IMAGE_NAME}-${SAFE_CTX}"
+
+      echo "Stack: $STACK | Context: $DETECTED_PATH | Mode: $SCAN_MODE"
+
+      # Export Env
+      echo "CONTEXT_PATH=$DETECTED_PATH" >> build.env
+      echo "FINAL_IMAGE_NAME=$FINAL_IMAGE_NAME" >> build.env
+      echo "STACK=$STACK" >> build.env
+      echo "SCAN_MODE=$SCAN_MODE" >> build.env
+
+  artifacts:
+    name: "source-$CI_PIPELINE_ID"
+    paths: [".", "*.json"]
+    reports:
+      dotenv: build.env
+    # ป้องกัน 413 Error และลดขนาดไฟล์ Zip ส่งต่อไปด่านอื่นๆ (เพิ่ม exclude pgdata ให้ชัวร์)
+    exclude: [".git/**/*", "**/.git/**/*", "**/node_modules/**/*", "**/pgdata/**/*"]
+    expire_in: 1 hour
+
+
+# 2. Security Audits (ALWAYS RUN)
+
+gitleaks_scan:
+  stage: security_audit
+  image:
+    name: zricethezav/gitleaks:$GITLEAKS_VERSION
+    entrypoint: [""]
+  variables: { GIT_STRATEGY: none }
+  needs: ["fetch_and_detect"]
+  script:
+    - echo "Gitleaks Scanning..."
+    # 🌟 ดึงประวัติไฟล์มาจาก URL เองโดยนำมาพักใน Folder ชั่วคราว (temp) ก่อนดึง .git มารวมกัน
+    - apk add --no-cache git curl || true
+    - |
+      if [ -n "$GIT_USERNAME" ] && [ -n "$GIT_TOKEN" ]; then
+         CLEAN=$(echo "$USER_REPO_URL" | sed -e 's|^https://||' -e 's|^http://||');
+         git clone "https://${GIT_USERNAME}:${GIT_TOKEN}@${CLEAN}" temp_git;
+      else
+         git clone "$USER_REPO_URL" temp_git;
+      fi
+      mv temp_git/.git .
+      rm -rf temp_git
+      git reset --mixed || true
+    - gitleaks detect --source . -v --report-path gitleaks-report.json --exit-code 0
+    
+    # Webhook: Send Gitleaks Report
+    - |
+      if [ "$ENABLE_WEBHOOKS" = "true" ]; then
+        SECRETS_COUNT=0
+        if [ -s gitleaks-report.json ]; then
+          SECRETS_COUNT=$(cat gitleaks-report.json | grep -c '"Description":' || echo 0)
+        fi
+        echo "Gitleaks found $SECRETS_COUNT secrets"
+        
+        if [ -s gitleaks-report.json ]; then
+          curl -X POST \
+            -F "pipelineId=$CI_PIPELINE_ID" \
+            -F "status=RUNNING" \
+            -F "tool=gitleaks" \
+            -F "secretsFound=$SECRETS_COUNT" \
+            -F "reportFile=@gitleaks-report.json" \
+            "$BACKEND_HOST_URL/api/webhook" || echo "Webhook failed"
+        else
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"RUNNING\", \"tool\": \"gitleaks\", \"secretsFound\": 0}" \
+            "$BACKEND_HOST_URL/api/webhook" || echo "Webhook failed"
+        fi
+      fi
+  allow_failure: true
+  artifacts: { paths: [gitleaks-report.json], when: always }
+
+semgrep_scan:
+  stage: security_audit
+  image: returntocorp/semgrep:$SEMGREP_VERSION
+  needs: ["fetch_and_detect"]
+  variables: { GIT_STRATEGY: none }
+  script:
+    # 🌟 ฟื้นคืนชีพ .git ให้ Semgrep อ่าน History ได้ โดยกู้ผ่าน Folder ชั่วคราวป้องกันการทับซ้อน
+    - apk add --no-cache git curl || true
+    - |
+      if [ ! -d ".git" ]; then
+        if [ -n "$GIT_USERNAME" ] && [ -n "$GIT_TOKEN" ]; then
+          CLEAN_URL=$(echo "$USER_REPO_URL" | sed -e 's|^https://||' -e 's|^http://||');
+          git clone "https://${GIT_USERNAME}:${GIT_TOKEN}@${CLEAN_URL}" temp_git;
+        else
+          git clone "$USER_REPO_URL" temp_git;
+        fi
+        mv temp_git/.git .
+        rm -rf temp_git
+        git reset --mixed || true
+      fi
+
+    # Added --exclude flags to prevent scanning large directories (node_modules, dist, etc.)
+    # This fixes the "exited with -9" (OOM) error.
+    - semgrep scan --config=p/ci --json --output=semgrep-report.json --metrics=off --exclude='node_modules' --exclude='dist' --exclude='build' --exclude='vendor' --exclude='.git' --exclude='**/*.min.js' "$CONTEXT_PATH"
+    
+    # Webhook: Send Semgrep Report
+    - |
+      if [ "$ENABLE_WEBHOOKS" = "true" ]; then
+        FINDINGS_COUNT=0
+        if [ -s semgrep-report.json ]; then
+          FINDINGS_COUNT=$(cat semgrep-report.json | grep -c '"check_id":' || echo 0)
+        fi
+        echo "Semgrep found $FINDINGS_COUNT code issues"
+        
+        # Send report file directly
+        if [ -s semgrep-report.json ]; then
+          curl -X POST \
+            -F "pipelineId=$CI_PIPELINE_ID" \
+            -F "status=RUNNING" \
+            -F "tool=semgrep" \
+            -F "findingsCount=$FINDINGS_COUNT" \
+            -F "reportFile=@semgrep-report.json" \
+            "$BACKEND_HOST_URL/api/webhook" || echo "Webhook failed"
+        else
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"RUNNING\", \"tool\": \"semgrep\", \"findingsCount\": 0}" \
+            "$BACKEND_HOST_URL/api/webhook" || echo "Webhook failed"
+        fi
+      fi
+  allow_failure: true
+  artifacts: { paths: [semgrep-report.json], when: always }
+
+# 3. Compile (SKIP IF SCAN_ONLY)
+compile_java_maven:
+  stage: compile
+  image: maven:$MAVEN_VERSION
+  needs: ["fetch_and_detect"]
+  variables: { GIT_STRATEGY: none }
+  cache:
+    - key: maven-$CI_PROJECT_ID
+      paths: [.m2/repository]
+    - key: compiled-jar-$CI_PIPELINE_ID
+      paths: [__compiled_bin/]
+      policy: push
+  script:
+    - mkdir -p .m2/repository/ 
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Skipped (Scan Only)"; exit 0; fi
+    - if [ "$STACK" != "java-maven" ]; then exit 0; fi
+    - if ! command -v node &> /dev/null; then curl -fsSL https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-x64.tar.gz | tar -xz -C /usr/local --strip-components=1 || true; fi
+    - cd "$CONTEXT_PATH"
+    - mvn clean package -DskipTests -B -q
+    - JAR=$(find target -name "*.jar" -not -name "*-sources.jar" -type f | head -1)
+    - if [ -n "$JAR" ]; then mkdir -p $CI_PROJECT_DIR/__compiled_bin; cp "$JAR" $CI_PROJECT_DIR/__compiled_bin/; echo "$CONTEXT_PATH/$(basename $JAR)" > $CI_PROJECT_DIR/.jar_path; fi
+  artifacts:
+    paths: [".jar_path"]
+    expire_in: 1h
+
+compile_java_gradle:
+  stage: compile
+  image: gradle:$GRADLE_VERSION
+  needs: ["fetch_and_detect"]
+  variables: { GIT_STRATEGY: none }
+  cache:
+    - key: maven-$CI_PROJECT_ID
+      paths: [.m2/repository]
+    - key: compiled-jar-$CI_PIPELINE_ID
+      paths: [__compiled_bin/]
+      policy: push
+  script:
+    - mkdir -p .gradle/ 
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Skipped (Scan Only)"; exit 0; fi
+    - if [ "$STACK" != "java-gradle" ]; then exit 0; fi
+    - if [ -f "$CONTEXT_PATH/Dockerfile" ] && [ ! -f "Dockerfile.manual" ]; then echo "Repo has Dockerfile - Kaniko handles multi-stage build, skipping pre-compile."; exit 0; fi
+    - cd "$CONTEXT_PATH"
+    - gradle clean build -x test --no-daemon -q
+    - JAR=$(find build/libs -name "*.jar" -not -name "*-plain.jar" -type f | head -1)
+    - if [ -n "$JAR" ]; then mkdir -p $CI_PROJECT_DIR/__compiled_bin; cp "$JAR" $CI_PROJECT_DIR/__compiled_bin/; echo "$CONTEXT_PATH/$(basename $JAR)" > $CI_PROJECT_DIR/.jar_path; fi
+  artifacts:
+    paths: [".jar_path"]
+    expire_in: 1h
+
+compile_go:
+  stage: compile
+  image: golang:$GO_VERSION
+  needs: ["fetch_and_detect"]
+  variables: { GIT_STRATEGY: none }
+  cache: { key: go-$CI_PROJECT_ID, paths: [.go/pkg/mod/] }
+  script:
+    - mkdir -p $CI_PROJECT_DIR/.go/pkg/mod/ 
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Skipped (Scan Only)"; exit 0; fi
+    - if [ "$STACK" != "go" ]; then exit 0; fi
+    - export GOPATH="$CI_PROJECT_DIR/.go"
+    - cd "$CONTEXT_PATH"
+    - go mod download
+    - CGO_ENABLED=0 GOOS=linux go build -o app .
+  artifacts: { paths: ["."], exclude: ["**/node_modules/**/*", "**/.git/**/*", "**/pgdata/**/*", "target/**/*", ".m2/**/*"], expire_in: 1h }
+
+compile_node:
+  stage: compile
+  image: node:$NODE_VERSION
+  needs: ["fetch_and_detect"]
+  variables: { GIT_STRATEGY: none }
+  cache: { key: node-$CI_PROJECT_ID, paths: [node_modules/] }
+  script:
+    - mkdir -p node_modules/ 
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Skipped (Scan Only)"; exit 0; fi
+    - if [ "$STACK" != "node" ]; then exit 0; fi
+    - cd "$CONTEXT_PATH"
+    - if [ -f "yarn.lock" ]; then yarn install --frozen-lockfile --silent; else npm ci --silent || npm install --silent; fi
+    - if grep -q '"build"' package.json; then npm run build || true; fi
+  artifacts: { paths: ["."], exclude: ["**/node_modules/**/*", "**/.git/**/*", "**/pgdata/**/*", "target/**/*", ".m2/**/*"], expire_in: 1h }
+
+compile_python:
+  stage: compile
+  image: python:$PYTHON_VERSION
+  needs: ["fetch_and_detect"]
+  variables: { GIT_STRATEGY: none }
+  script:
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Skipped (Scan Only)"; exit 0; fi
+    - if [ "$STACK" != "python" ]; then exit 0; fi
+    - echo "Python detected."
+  artifacts: { paths: ["."], exclude: ["**/node_modules/**/*", "**/.git/**/*", "**/pgdata/**/*", "target/**/*", ".m2/**/*"], expire_in: 1h }
+
+
+# 4. Build Docker Image (SKIP IF SCAN_ONLY)
+build_and_push:
+  stage: build_artifact
+  image:
+    name: gcr.io/kaniko-project/executor:$KANIKO_VERSION
+    entrypoint: [""]
+  needs:
+    - job: fetch_and_detect
+      artifacts: true
+    - job: compile_java_maven
+      optional: true
+    - job: compile_java_gradle
+      optional: true
+    - job: compile_go
+      optional: true
+    - job: compile_node
+      optional: true
+    - job: compile_python
+      optional: true
+  cache:
+    - key: compiled-jar-$CI_PIPELINE_ID
+      paths: [__compiled_bin/]
+      policy: pull
+    
+  script:
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Build skipped (SCAN_ONLY mode selected)."; exit 0; fi
+    - echo "Building Docker Image..."
+    - if [ -z "$DOCKER_USER" ]; then echo "No Docker Creds"; exit 1; fi
+    - if [ "$STACK" = "unknown" ]; then echo "Unknown stack, skipping build"; exit 0; fi
+    
+    # --- RESTORE JAR TO ORIGINAL PATH FOR EXISTING DOCKERFILES ---
+    - |
+      if [ -f ".jar_path" ]; then
+        JAR_ROOT_PATH=$(cat .jar_path)
+        JAR_BASENAME=$(basename "$JAR_ROOT_PATH")
+        if [ "$STACK" = "java-maven" ]; then
+          mkdir -p "$CONTEXT_PATH/target"
+          cp "__compiled_bin/$JAR_BASENAME" "$CONTEXT_PATH/target/$JAR_BASENAME" || true
+          cp "__compiled_bin/$JAR_BASENAME" "$CONTEXT_PATH/$JAR_BASENAME" || true
+        elif [ "$STACK" = "java-gradle" ]; then
+          mkdir -p "$CONTEXT_PATH/build/libs"
+          cp "__compiled_bin/$JAR_BASENAME" "$CONTEXT_PATH/build/libs/$JAR_BASENAME" || true
+          cp "__compiled_bin/$JAR_BASENAME" "$CONTEXT_PATH/$JAR_BASENAME" || true
+        fi
+      fi
+      
+    - DOCKERFILE_PATH="$CONTEXT_PATH/Dockerfile"
+
+    # [KANIKO FIX] Patch named --chown to numeric 0:0 for Kaniko compatibility
+    # Kaniko requires numeric UID/GID or pre-existing system user
+    - |
+      if [ -f "$DOCKERFILE_PATH" ]; then
+        sed -i 's/COPY --chown=[a-zA-Z][a-zA-Z0-9_-]*/COPY --chown=0:0/g' "$DOCKERFILE_PATH" || true
+        echo "Patched COPY --chown to numeric UID for Kaniko"
+      fi
+
+    # Dockerfile Generation
+    - |
+      if [ -f "Dockerfile.manual" ]; then
+        cp Dockerfile.manual "$DOCKERFILE_PATH"
+      elif [ -f "$DOCKERFILE_PATH" ]; then
+        echo "Using existing $DOCKERFILE_PATH"
+      elif [ "$CONTEXT_PATH" != "." ] && [ -f "Dockerfile" ]; then
+        DOCKERFILE_PATH="Dockerfile"
+        CONTEXT_PATH="." 
+      else
+        echo "Auto-generating Dockerfile for $STACK"
+        if [ "$STACK" = "java-maven" ] || [ "$STACK" = "java-gradle" ]; then
+           JAR_FILE_PATH=$(cat .jar_path | sed "s|$CONTEXT_PATH/||")
+           echo -e "FROM eclipse-temurin:21-jre-alpine\nWORKDIR /app\nCOPY $JAR_FILE_PATH app.jar\nENTRYPOINT [\"java\", \"-jar\", \"app.jar\"]" > "$DOCKERFILE_PATH"
+        elif [ "$STACK" = "node" ]; then
+           echo -e "FROM node:$NODE_VERSION\nWORKDIR /app\nCOPY . .\nCMD [\"npm\", \"start\"]" > "$DOCKERFILE_PATH"
+        elif [ "$STACK" = "go" ]; then
+           echo -e "FROM alpine:latest\nWORKDIR /app\nCOPY app .\nCMD [\"./app\"]" > "$DOCKERFILE_PATH"
+        elif [ "$STACK" = "python" ]; then
+           echo -e "FROM python:$PYTHON_VERSION\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt || true\nCMD [\"python\", \"app.py\"]" > "$DOCKERFILE_PATH"
+        else
+           echo -e "FROM alpine:latest\nWORKDIR /app\nCOPY . .\nCMD [\"/bin/sh\"]" > "$DOCKERFILE_PATH"
+        fi
+      fi
+    - echo "Building:$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG"
+    - mkdir -p /kaniko/.docker
+    - AUTH_STR=$(echo -n "$DOCKER_USER:$DOCKER_PASSWORD" | base64 | tr -d '\n')
+    - echo "{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"$AUTH_STR\"},\"index.docker.io\":{\"auth\":\"$AUTH_STR\"}}}" > /kaniko/.docker/config.json
+    - /kaniko/executor --context "$CI_PROJECT_DIR/$CONTEXT_PATH" --dockerfile "$CI_PROJECT_DIR/$DOCKERFILE_PATH" --destination "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" --snapshot-mode=redo --use-new-run --push-retry 3 --ignore-path=/product_uuid --ignore-path=/sys
+
+# 5. Container Scan (User Mode - Cached DB)
+trivy_scan:
+  stage: container_scan
+  image:
+    name: aquasec/trivy:$TRIVY_VERSION
+    entrypoint: [""] 
+  needs: ["build_and_push", "fetch_and_detect"]
+  variables:
+    TRIVY_USERNAME: "$DOCKER_USER"
+    TRIVY_PASSWORD: "$DOCKER_PASSWORD"
+    TRIVY_AUTH_URL: "https://index.docker.io/v1/"
+    TRIVY_CACHE_DIR: ".trivycache/"
+  
+  cache:
+    key: trivy-global-cache
+    paths: [.trivycache/]
+    policy: pull
+  
+  script:
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Container Scan skipped (SCAN_ONLY mode)."; exit 0; fi
+
+    - echo "Scanning:$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG"
+    - apk add --no-cache curl
+
+    # Cache handling
+    - |
+      if [ ! -f ".trivycache/db/trivy.db" ]; then
+        echo "Cache not found! Downloading fallback..."
+        trivy image --download-db-only --cache-dir .trivycache/
+      else
+        echo "Using Cached DB (Fast Mode)"
+      fi
+
+    # Scan execution
+    - trivy image --timeout 15m --scanners vuln --format json --output trivy-report.json --skip-db-update --severity CRITICAL,HIGH,MEDIUM --ignore-unfixed "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" || echo '{"Results":[]}' > trivy-report.json
+
+    - |
+      if [ -f trivy-report.json ] && [ "$ENABLE_WEBHOOKS" = "true" ]; then
+        curl -X POST -H "Content-Type: application/json" \
+        -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"SUCCESS\"}" \
+        "$BACKEND_HOST_URL/api/webhook" || true
+      fi
+  allow_failure: true
+  artifacts: { paths: [trivy-report.json], when: always }
+
+# 5b. SBOM Generation — ใช้ Trivy สร้าง Software Bill of Materials (CycloneDX format)
+# รัน parallel กับ container_scan stage เดิม, allow_failure ไม่หยุด pipeline
+generate_sbom:
+  stage: container_scan
+  image:
+    name: aquasec/trivy:$TRIVY_VERSION
+    entrypoint: [""]
+  needs: ["trivy_scan", "fetch_and_detect"]
+  variables:
+    TRIVY_USERNAME: "$DOCKER_USER"
+    TRIVY_PASSWORD: "$DOCKER_PASSWORD"
+    TRIVY_AUTH_URL: "https://index.docker.io/v1/"
+    TRIVY_CACHE_DIR: ".trivycache/"
+  cache:
+    key: trivy-global-cache
+    paths: [.trivycache/]
+    policy: pull
+  script:
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "SBOM skipped (SCAN_ONLY mode)"; exit 0; fi
+    - echo "Generating SBOM (CycloneDX) for $FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG"
+    - apk add --no-cache curl
+    - |
+      if [ ! -f ".trivycache/db/trivy.db" ]; then
+        trivy image --download-db-only --cache-dir .trivycache/
+      fi
+    - trivy image --format cyclonedx --output sbom-cyclonedx.json --skip-db-update "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" || echo '{"bomFormat":"CycloneDX","components":[]}' > sbom-cyclonedx.json
+    - |
+      if [ -s sbom-cyclonedx.json ] && [ "$ENABLE_WEBHOOKS" = "true" ]; then
+        curl -X POST \
+          -F "pipelineId=$CI_PIPELINE_ID" \
+          -F "tool=sbom" \
+          -F "reportFile=@sbom-cyclonedx.json" \
+          "$BACKEND_HOST_URL/api/webhook" || echo "SBOM webhook failed (non-critical)"
+      fi
+  allow_failure: true
+  artifacts:
+    paths: [sbom-cyclonedx.json]
+    when: always
+    expire_in: 30 days
+
+
+
+push_to_hub:
+  stage: release
+  image:
+    name: alpine:latest
+    entrypoint: [""]
+  needs: ["trivy_scan", "fetch_and_detect"]
+  when: manual
+  script:
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Release skipped (SCAN_ONLY mode)."; exit 0; fi
+    - echo "Promoting to $USER_TAG"
+    - apk add --no-cache grep curl tar
+    - CRITICALS=$(grep -o '"Severity":"CRITICAL"' trivy-report.json 2>/dev/null | wc -l || echo "0")
+    - if [ "$CRITICALS" -gt 0 ]; then echo "BLOCKED:$CRITICALS Critical Vulns"; exit 1; fi
+    - curl -sL https://github.com/google/go-containerregistry/releases/download/v0.19.1/go-containerregistry_Linux_x86_64.tar.gz | tar -xz -C /usr/local/bin crane
+    - crane auth login -u "$DOCKER_USER" -p "$DOCKER_PASSWORD" index.docker.io
+    - crane cp "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" "$FINAL_IMAGE_NAME:$USER_TAG"
+    - crane delete "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG"
+    - |
+      if [ "$ENABLE_WEBHOOKS" = "true" ]; then
+         curl -X POST -H "Content-Type: application/json" -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"SUCCESS\", \"image\": \"$FINAL_IMAGE_NAME:$USER_TAG\"}" "$BACKEND_HOST_URL/api/webhook" || true
+      fi
+
+# 6b. Cosign — Sign image หลัง push ด้วย Sigstore Cosign
+# ต้องตั้ง COSIGN_PRIVATE_KEY + COSIGN_PASSWORD ใน GitLab CI/CD Variables
+# ถ้าไม่มี Variable — skip อัตโนมัติ ไม่กระทบ pipeline
+sign_image:
+  stage: release
+  image:
+    name: bitnami/cosign:latest
+    entrypoint: [""]
+  needs: ["push_to_hub", "fetch_and_detect"]
+  variables: { GIT_STRATEGY: none }
+  script:
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Signing skipped (SCAN_ONLY mode)"; exit 0; fi
+    - echo "Signing $FINAL_IMAGE_NAME:$USER_TAG with Cosign..."
+    - |
+      if [ -n "$COSIGN_PRIVATE_KEY" ]; then
+        echo "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+        COSIGN_PASSWORD="$COSIGN_PASSWORD" cosign sign --key /tmp/cosign.key --yes "$FINAL_IMAGE_NAME:$USER_TAG" || echo "Cosign sign failed (non-critical)"
+        rm -f /tmp/cosign.key
+      else
+        echo "COSIGN_PRIVATE_KEY not set — signing skipped. Set CI/CD variable to enable."
+      fi
+  allow_failure: true
+
+
+  stage: cleanup
+  image:
+    name: gcr.io/go-containerregistry/crane:$CRANE_VERSION
+    entrypoint: [""]
+  needs: ["fetch_and_detect"]
+  variables: { GIT_STRATEGY: none }
+  script:
+    - |
+      if [ "$SCAN_MODE" == "SCAN_ONLY" ] && [ "$ENABLE_WEBHOOKS" = "true" ]; then
+         echo "Scan Only mode completed. Sending SUCCESS webhook."
+         wget --header="Content-Type: application/json" \
+         --post-data="{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"SUCCESS\"}" \
+         "$BACKEND_HOST_URL/api/webhook" -O - || true
+      fi
+    - if [ "$SCAN_MODE" == "SCAN_ONLY" ] || [ -z "$DOCKER_USER" ]; then exit 0; fi
+    - crane auth login -u "$DOCKER_USER" -p "$DOCKER_PASSWORD" index.docker.io || true
+    - crane delete "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" || true
+    - |
+      if [ "$CI_JOB_STATUS" == "failed" ] && [ "$ENABLE_WEBHOOKS" = "true" ]; then
+         wget --header="Content-Type: application/json" \
+         --post-data="{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"FAILED\"}" \
+         "$BACKEND_HOST_URL/api/webhook" -O - || true
+      fi
+  when: always

@@ -1,0 +1,48 @@
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "80:3000"
+    env_file: ../.env
+    environment:
+      - DATABASE_URL=postgresql://VisScan:VisScan1234@db:5432/scandb?schema=public
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      - db
+      - rabbitmq
+    restart: always
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    command: /bin/sh -c "npx prisma db push && npx tsx scripts/create-admin.ts && npm run worker"
+    env_file: ../.env
+    environment:
+      - DATABASE_URL=postgresql://VisScan:VisScan1234@db:5432/scandb?schema=public
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      - db
+      - rabbitmq
+    restart: always
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: VisScan
+      POSTGRES_PASSWORD: VisScan1234
+      POSTGRES_DB: scandb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    env_file: .env
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+
+volumes:
+  postgres_data:

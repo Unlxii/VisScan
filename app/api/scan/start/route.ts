@@ -1,0 +1,342 @@
+import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+import { decrypt } from "@/lib/crypto";
+import { checkUserQuota, checkScanQuota } from "@/lib/quotaManager";
+import { publishScanJob } from "@/lib/queue/publisher";
+import { ScanJob } from "@/lib/queue/types";
+import {
+  MAX_SCANS_PER_SERVICE,
+  AUTO_CLEANUP_ENABLED,
+  MAX_SCAN_AGE_DAYS,
+} from "@/lib/scanConfig";
+import { checkDuplicateGlobally } from "@/lib/validators/serviceValidator";
+import { z } from "zod";
+import { logAction, AuditAction } from "@/lib/logger";
+
+const ScanStartSchema = z.object({
+  serviceId: z.string().optional(),
+  scanMode: z.enum(["SCAN_ONLY", "SCAN_AND_BUILD"]).default("SCAN_AND_BUILD"),
+  imageTag: z.string().default("latest"),
+  repoUrl: z.string().url().optional(),
+  contextPath: z.string().optional(),
+  imageName: z.string().optional(),
+  projectName: z.string().optional(),
+  customDockerfile: z.string().optional(),
+  trivyScanMode: z.enum(["fast", "full"]).optional(),
+  description: z.string().optional(), // [NEW] Description
+  force: z.boolean().default(false),
+  buildArgs: z.record(z.string(), z.string()).optional(), // [NEW] Custom Docker build args
+});
+
+export async function POST(req: Request) {
+  try {
+    const session = await getServerSession(authOptions);
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const userId = (session.user as any).id;
+    const body = await req.json();
+
+    const parseResult = ScanStartSchema.safeParse(body);
+    if (!parseResult.success) {
+      return NextResponse.json(
+        { error: "Validation Error", details: parseResult.error.format() },
+        { status: 400 }
+      );
+    }
+
+    const {
+      serviceId,
+      scanMode,
+      imageTag,
+      repoUrl: manualRepoUrl,
+      contextPath: manualContextPath,
+      imageName: manualImageName,
+      projectName: manualProjectName,
+      force,
+      description,
+    } = parseResult.data;
+
+    // Validate scan mode
+    if (!["SCAN_ONLY", "SCAN_AND_BUILD"].includes(scanMode)) {
+      return NextResponse.json({ error: "Invalid scan mode" }, { status: 400 });
+    }
+
+    const userProfile = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        name: true,
+        email: true,
+      },
+    });
+
+    const credentials = await prisma.credential.findMany({
+      where: {
+        userId: userId,
+        isDefault: true,
+      },
+    });
+
+    const gitCred = credentials.find((c) => c.provider === "GITHUB");
+    const dockerCred = credentials.find((c) => c.provider === "DOCKER");
+
+    if (!gitCred) {
+      return NextResponse.json(
+        {
+          error:
+            "Missing Default GitHub Credential. Please go to Settings > Identity & Access to configure your GitHub Token and Username.",
+        },
+        { status: 400 },
+      );
+    }
+
+    if (scanMode === "SCAN_AND_BUILD" && !dockerCred) {
+      return NextResponse.json(
+        {
+          error:
+            "Missing Default Docker Credential. Please go to Settings > Identity & Access to configure your Docker Token, Username, and Registry.",
+        },
+        { status: 400 },
+      );
+    }
+
+    let finalConfig: any = {};
+    let projectId: string | undefined;
+
+    // --- Logic การหา Service หรือ Manual Scan ---
+    if (serviceId) {
+      const service = await prisma.projectService.findUnique({
+        where: { id: serviceId },
+        include: { group: { include: { user: true } } },
+      });
+
+      if (!service)
+        return NextResponse.json(
+          { error: "Service not found" },
+          { status: 404 },
+        );
+      
+      // Allow admin to re-scan any service
+      const userRole = (session.user as any).role;
+      if (service.group.userId !== userId && userRole !== "admin")
+        return NextResponse.json({ error: "Access denied" }, { status: 403 });
+
+      const scanQuota = await checkScanQuota(serviceId);
+      if (!scanQuota.canScan) {
+        return NextResponse.json(
+          { error: scanQuota.error || "Scan in progress" },
+          { status: 429 },
+        );
+      }
+
+      projectId = service.id;
+      finalConfig = {
+        repoUrl: service.group.repoUrl,
+        contextPath: service.contextPath || ".",
+        imageName: service.imageName,
+        projectName: service.group.groupName,
+        customDockerfile: service.dockerfileContent,
+      };
+    } else {
+      if (!manualRepoUrl || !manualImageName) {
+        return NextResponse.json(
+          { error: "repoUrl and imageName required" },
+          { status: 400 },
+        );
+      }
+      const quotaCheck = await checkUserQuota(userId);
+      if (!quotaCheck.canCreate)
+        return NextResponse.json({ error: "Quota exceeded" }, { status: 429 });
+
+      // Check for duplicate service globally (unless force=true)
+      if (!force) {
+        const duplicateCheck = await checkDuplicateGlobally(
+          manualRepoUrl,
+          manualContextPath || ".",
+          manualImageName,
+          userId
+        );
+
+        if (duplicateCheck.isDuplicate && duplicateCheck.existingService) {
+          const existing = duplicateCheck.existingService;
+          return NextResponse.json(
+            {
+              error: "Service already exists",
+              isDuplicate: true,
+              existingService: {
+                id: existing.id,
+                serviceName: existing.serviceName,
+                imageName: existing.imageName,
+                contextPath: existing.contextPath,
+                groupId: existing.groupId,
+                groupName: existing.groupName,
+                repoUrl: existing.repoUrl,
+                lastScan: existing.lastScan,
+              },
+              suggestion:
+                "This service configuration already exists. You can re-scan the existing service or create a new one anyway.",
+            },
+            { status: 409 }
+          );
+        }
+      }
+
+      finalConfig = {
+        repoUrl: manualRepoUrl,
+        contextPath: manualContextPath || ".",
+        imageName: manualImageName,
+        projectName: manualProjectName || "manual-scan",
+      };
+
+      const newGroup = await prisma.projectGroup.create({
+        data: {
+          userId,
+          groupName: finalConfig.projectName,
+          repoUrl: finalConfig.repoUrl,
+          isActive: true,
+        },
+      });
+      const newService = await prisma.projectService.create({
+        data: {
+          groupId: newGroup.id,
+          serviceName: finalConfig.imageName,
+          imageName: finalConfig.imageName,
+          contextPath: finalConfig.contextPath,
+        },
+      });
+      projectId = newService.id;
+    }
+
+    const githubToken = decrypt(gitCred.token);
+    const githubUsername = gitCred.username || "";
+
+    const dockerToken = dockerCred ? decrypt(dockerCred.token) : undefined;
+
+    // Create History
+    const scanHistory = await prisma.scanHistory.create({
+      data: {
+        serviceId: projectId!,
+        scanMode: scanMode,
+        scanId: `WAITING-${Date.now()}`,
+        pipelineId: `WAITING-${Date.now()}`,
+        imageTag: imageTag,
+        status: "QUEUED",
+        startedAt: new Date(),
+        details: {
+          repoUrl: finalConfig.repoUrl,
+          contextPath: finalConfig.contextPath,
+          imageName: finalConfig.imageName,
+          projectName: finalConfig.projectName,
+        },
+        description: description, // [NEW] Save description
+      },
+    });
+
+    // Prepare Job
+    const job: ScanJob = {
+      id: scanHistory.id,
+      type: scanMode === "SCAN_AND_BUILD" ? "SCAN_AND_BUILD" : "SCAN_ONLY",
+      priority: 1,
+      createdAt: new Date().toISOString(),
+      userId,
+
+      username: userProfile?.name || userProfile?.email || "Unknown User",
+
+      serviceId: projectId!,
+      scanHistoryId: scanHistory.id,
+
+      repoUrl: finalConfig.repoUrl,
+      contextPath: finalConfig.contextPath,
+      isPrivate: true,
+
+      imageName: finalConfig.imageName,
+      imageTag: imageTag,
+      customDockerfile: finalConfig.customDockerfile,
+
+      gitToken: githubToken,
+      gitUsername: githubUsername,
+      dockerToken: dockerToken,
+      dockerUser: dockerCred?.username,
+
+      // [NEW] Custom build args
+      buildArgs: parseResult.data.buildArgs as Record<string, string> | undefined,
+
+      // [NEW] Default to FULL scan
+      trivyScanMode: "full",
+    };
+
+    const published = await publishScanJob(job);
+
+    if (!published) {
+      await prisma.scanHistory.update({
+        where: { id: scanHistory.id },
+        data: {
+          status: "FAILED_TRIGGER",
+          errorMessage: "Failed to enqueue job",
+        },
+      });
+      throw new Error("Failed to publish job");
+    }
+
+    if (AUTO_CLEANUP_ENABLED && projectId) {
+      cleanupOldScans(projectId).catch((err) =>
+        console.error("Cleanup error:", err),
+      );
+    }
+
+
+    
+    // Audit Log
+    await logAction(userId, AuditAction.SCAN_START, `ScanHistory:${scanHistory.id}`, {
+      serviceId: projectId,
+      scanMode,
+      imageTag,
+      repoUrl: finalConfig.repoUrl,
+    });
+
+    return NextResponse.json({
+      success: true,
+      scanId: scanHistory.id,
+      status: "QUEUED",
+      message: "Job queued successfully",
+      estimatedDuration: serviceId ? (await prisma.projectService.findUnique({ where: { id: serviceId }, select: { averageDuration: true } }))?.averageDuration : undefined,
+    });
+  } catch (error: any) {
+    console.error("[Scan Start Error]:", error);
+    return NextResponse.json(
+      { error: error.message || "Internal server error" },
+      { status: 500 },
+    );
+  }
+}
+
+async function cleanupOldScans(serviceId: string) {
+  try {
+    const scansToDelete = await prisma.scanHistory.findMany({
+      where: { serviceId },
+      orderBy: { startedAt: "desc" },
+      skip: MAX_SCANS_PER_SERVICE,
+      select: { id: true },
+    });
+    
+    if (scansToDelete.length > 0) {
+      await prisma.scanHistory.deleteMany({
+        where: { id: { in: scansToDelete.map((s) => s.id) } },
+      });
+    }
+
+    if (MAX_SCAN_AGE_DAYS > 0) {
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - MAX_SCAN_AGE_DAYS);
+      await prisma.scanHistory.deleteMany({
+        where: { serviceId, startedAt: { lt: cutoffDate } },
+      });
+    }
+  } catch (err) {
+    console.error("Auto cleanup failed:", err);
+  }
+}
