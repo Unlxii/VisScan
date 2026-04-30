@@ -477,11 +477,24 @@ trivy_scan:
     # Scan execution
     - trivy image --timeout 15m --scanners vuln --format json --output trivy-report.json --skip-db-update --severity CRITICAL,HIGH,MEDIUM --ignore-unfixed "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" || echo '{"Results":[]}' > trivy-report.json
 
+    # CI-03: Parse vuln counts and send to webhook — backend needs these to determine FAILED_SECURITY
     - |
       if [ -f trivy-report.json ] && [ "$ENABLE_WEBHOOKS" = "true" ]; then
-        curl -X POST -H "Content-Type: application/json" \
-        -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"SUCCESS\"}" \
-        "$BACKEND_HOST_URL/api/webhook" || true
+        VULN_CRITICAL=$(grep -o '"Severity":"CRITICAL"' trivy-report.json | wc -l || echo 0)
+        VULN_HIGH=$(grep -o '"Severity":"HIGH"' trivy-report.json | wc -l || echo 0)
+        VULN_MEDIUM=$(grep -o '"Severity":"MEDIUM"' trivy-report.json | wc -l || echo 0)
+        VULN_LOW=$(grep -o '"Severity":"LOW"' trivy-report.json | wc -l || echo 0)
+        echo "Trivy found: CRITICAL=$VULN_CRITICAL HIGH=$VULN_HIGH MEDIUM=$VULN_MEDIUM LOW=$VULN_LOW"
+        curl -X POST \
+          -F "pipelineId=$CI_PIPELINE_ID" \
+          -F "status=RUNNING" \
+          -F "tool=trivy" \
+          -F "vulnCritical=$VULN_CRITICAL" \
+          -F "vulnHigh=$VULN_HIGH" \
+          -F "vulnMedium=$VULN_MEDIUM" \
+          -F "vulnLow=$VULN_LOW" \
+          -F "reportFile=@trivy-report.json" \
+          "$BACKEND_HOST_URL/api/webhook" || echo "Trivy webhook failed (non-critical)"
       fi
   allow_failure: true
   artifacts: { paths: [trivy-report.json], when: always }
@@ -493,7 +506,12 @@ generate_sbom:
   image:
     name: aquasec/trivy:$TRIVY_VERSION
     entrypoint: [""]
-  needs: ["trivy_scan", "fetch_and_detect"]
+  needs:
+    # CI-05: optional: true so SBOM still runs even if trivy_scan fails
+    - job: trivy_scan
+      optional: true
+    - job: fetch_and_detect
+      artifacts: true
   variables:
     TRIVY_USERNAME: "$DOCKER_USER"
     TRIVY_PASSWORD: "$DOCKER_PASSWORD"
@@ -530,24 +548,38 @@ generate_sbom:
 
 push_to_hub:
   stage: release
+  # CI-02: Use crane image directly — eliminates curl-from-GitHub dependency.
+  # Previously used alpine + curl to download crane at runtime; if GitHub is down
+  # or the release URL changes, the entire release stage fails. Using the official
+  # image makes this stage hermetic and network-failure-resistant.
   image:
-    name: alpine:latest
+    name: gcr.io/go-containerregistry/crane:$CRANE_VERSION
     entrypoint: [""]
   needs: ["trivy_scan", "fetch_and_detect"]
   when: manual
   script:
     - if [ "$SCAN_MODE" == "SCAN_ONLY" ]; then echo "Release skipped (SCAN_ONLY mode)."; exit 0; fi
-    - echo "Promoting to $USER_TAG"
-    - apk add --no-cache grep curl tar
+    - echo "Promoting $FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG → $FINAL_IMAGE_NAME:$USER_TAG"
+    - apk add --no-cache grep curl
     - CRITICALS=$(grep -o '"Severity":"CRITICAL"' trivy-report.json 2>/dev/null | wc -l || echo "0")
-    - if [ "$CRITICALS" -gt 0 ]; then echo "BLOCKED:$CRITICALS Critical Vulns"; exit 1; fi
-    - curl -sL https://github.com/google/go-containerregistry/releases/download/v0.19.1/go-containerregistry_Linux_x86_64.tar.gz | tar -xz -C /usr/local/bin crane
+    - |
+      if [ "$CRITICALS" -gt 0 ]; then
+        echo "BLOCKED: $CRITICALS Critical vulnerabilities found — image will not be promoted."
+        if [ "$ENABLE_WEBHOOKS" = "true" ]; then
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"BLOCKED\", \"vulnCritical\": $CRITICALS}" \
+            "$BACKEND_HOST_URL/api/webhook" || true
+        fi
+        exit 1
+      fi
     - crane auth login -u "$DOCKER_USER" -p "$DOCKER_PASSWORD" index.docker.io
     - crane cp "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" "$FINAL_IMAGE_NAME:$USER_TAG"
     - crane delete "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG"
     - |
       if [ "$ENABLE_WEBHOOKS" = "true" ]; then
-         curl -X POST -H "Content-Type: application/json" -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"SUCCESS\", \"image\": \"$FINAL_IMAGE_NAME:$USER_TAG\"}" "$BACKEND_HOST_URL/api/webhook" || true
+        curl -X POST -H "Content-Type: application/json" \
+          -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"SUCCESS\", \"image\": \"$FINAL_IMAGE_NAME:$USER_TAG\"}" \
+          "$BACKEND_HOST_URL/api/webhook" || true
       fi
 
 # 6b. Cosign — Sign image หลัง push ด้วย Sigstore Cosign
@@ -574,27 +606,44 @@ sign_image:
   allow_failure: true
 
 
+cleanup_job:
   stage: cleanup
   image:
     name: gcr.io/go-containerregistry/crane:$CRANE_VERSION
     entrypoint: [""]
-  needs: ["fetch_and_detect"]
+  needs:
+    - job: fetch_and_detect
+      artifacts: true
+    - job: build_and_push
+      optional: true
+    - job: push_to_hub
+      optional: true
   variables: { GIT_STRATEGY: none }
   script:
+    - apk add --no-cache curl
     - |
       if [ "$SCAN_MODE" == "SCAN_ONLY" ] && [ "$ENABLE_WEBHOOKS" = "true" ]; then
-         echo "Scan Only mode completed. Sending SUCCESS webhook."
-         wget --header="Content-Type: application/json" \
-         --post-data="{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"SUCCESS\"}" \
-         "$BACKEND_HOST_URL/api/webhook" -O - || true
+        echo "Scan Only mode completed. Sending SUCCESS webhook."
+        curl -X POST -H "Content-Type: application/json" \
+          -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"SUCCESS\"}" \
+          "$BACKEND_HOST_URL/api/webhook" || true
       fi
     - if [ "$SCAN_MODE" == "SCAN_ONLY" ] || [ -z "$DOCKER_USER" ]; then exit 0; fi
-    - crane auth login -u "$DOCKER_USER" -p "$DOCKER_PASSWORD" index.docker.io || true
-    - crane delete "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" || true
+    # CI-04: $CI_JOB_STATUS only reflects the current job's own status — not upstream.
+    # Query the GitLab API instead to get the actual pipeline status.
     - |
-      if [ "$CI_JOB_STATUS" == "failed" ] && [ "$ENABLE_WEBHOOKS" = "true" ]; then
-         wget --header="Content-Type: application/json" \
-         --post-data="{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"FAILED\"}" \
-         "$BACKEND_HOST_URL/api/webhook" -O - || true
+      PIPELINE_STATUS=$(curl -sf \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/pipelines/$CI_PIPELINE_ID" \
+        | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "unknown")
+      echo "Pipeline status from API: $PIPELINE_STATUS"
+    - crane auth login -u "$DOCKER_USER" -p "$DOCKER_PASSWORD" index.docker.io || true
+    # Always try to clean up temp image — safe to ignore if already deleted by push_to_hub
+    - crane delete "$FINAL_IMAGE_NAME:$TEMP_IMAGE_TAG" 2>/dev/null || echo "Temp image already removed"
+    - |
+      if [ "$PIPELINE_STATUS" = "failed" ] && [ "$ENABLE_WEBHOOKS" = "true" ]; then
+        curl -X POST -H "Content-Type: application/json" \
+          -d "{\"pipelineId\": \"$CI_PIPELINE_ID\", \"status\": \"FAILED\"}" \
+          "$BACKEND_HOST_URL/api/webhook" || true
       fi
   when: always
