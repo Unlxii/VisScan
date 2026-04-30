@@ -32,7 +32,7 @@ VisScan depends on two pieces of institutional infrastructure that are not publi
 
 ---
 
-## 🖥️ Local Demo (HR / Non-Technical Preview)
+## Local Demo (HR / Non-Technical Preview)
 
 > ดูหน้าตา UI และ flow ของระบบได้ทันที **โดยไม่ต้องใช้ CMU Account หรือ GitLab**
 
