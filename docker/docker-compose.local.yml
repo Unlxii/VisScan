@@ -1,0 +1,89 @@
+# ============================================================
+#  VisScan — Local Demo Environment
+#  สำหรับ HR / Demo ที่ต้องการ run บนเครื่อง local
+#  ใช้คำสั่ง: docker compose -f docker/docker-compose.local.yml up --build
+# ============================================================
+
+services:
+
+  # ─── Web Application (Next.js) ───────────────────────────
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.local
+    container_name: visscan-web
+    ports:
+      - "3000:3000"
+    env_file: ../.env.local
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://visscan:visscan1234@db:5432/scandb?schema=public
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/validate"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ─── Background Worker (Scanner) ─────────────────────────
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    container_name: visscan-worker
+    command: /bin/sh -c "npx prisma db push --skip-generate && npx tsx scripts/create-admin.ts && npm run worker"
+    env_file: ../.env.local
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://visscan:visscan1234@db:5432/scandb?schema=public
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── PostgreSQL Database ──────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: visscan-db
+    environment:
+      POSTGRES_USER: visscan
+      POSTGRES_PASSWORD: visscan1234
+      POSTGRES_DB: scandb
+    volumes:
+      - visscan_local_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U visscan -d scandb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── RabbitMQ Message Broker ──────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: visscan-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "15672:15672"   # Management UI (optional — http://localhost:15672)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  visscan_local_pgdata:
+    name: visscan_local_pgdata

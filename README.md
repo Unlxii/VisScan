@@ -30,7 +30,33 @@ VisScan depends on two pieces of institutional infrastructure that are not publi
 - The **Screenshots** section (sourced from `public/landing/`) shows the real UI in production.
 - The **source code** itself — `worker/index.ts`, `lib/queue/publisher.ts`, `.gitlab-ci.yml`, `app/api/webhook/route.ts`, and `prisma/schema.prisma` — are the most representative files for technical evaluation.
 
-A `LOCAL_DEMO_MODE` (mock auth + mock pipeline triggers) is planned as a future enhancement to make the platform fully evaluable offline. See the [Local Demo Mode Strategy](#local-demo-mode-strategy-planned) section at the bottom of this README.
+---
+
+## 🖥️ Local Demo (HR / Non-Technical Preview)
+
+> ดูหน้าตา UI และ flow ของระบบได้ทันที **โดยไม่ต้องใช้ CMU Account หรือ GitLab**
+
+**ข้อกำหนด:** ติดตั้ง [Docker Desktop](https://www.docker.com/products/docker-desktop/) แล้ว
+
+```bash
+# macOS / Linux
+cp .env.local.example .env.local
+
+# Windows (PowerShell)
+copy .env.local.example .env.local
+
+# Build และ start ทุก services
+docker compose -f docker/docker-compose.local.yml up --build
+```
+
+เปิดเบราว์เซอร์ที่ **http://localhost:3000** แล้ว login ด้วย:
+
+| Field    | Value                |
+|----------|----------------------|
+| Email    | `SuperAdmin@VisScan` |
+| Password | `LocalDemo1234!`     |
+
+> ดูคู่มือฉบับเต็มได้ที่ [LOCAL_DEMO_GUIDE.md](./LOCAL_DEMO_GUIDE.md)
 
 ---
 
@@ -261,7 +287,9 @@ VisScan/
 ├── docker/
 │   ├── Dockerfile                # Multi-stage Next.js production image
 │   ├── Dockerfile.worker         # Worker image (tsx runtime)
+│   ├── Dockerfile.local          # Local demo image (development mode, no CMU OAuth)
 │   ├── docker-compose.prod.yml   # web + worker services
+│   ├── docker-compose.local.yml  # Local demo: all services, no external dependencies
 │   ├── docker-compose.db.yml     # postgres + rabbitmq
 │   └── docker-compose.runner.yml # GitLab runner (mounts /var/run/docker.sock)
 │
@@ -325,20 +353,6 @@ The runner uses the Docker executor with `/var/run/docker.sock` mounted, allowin
 | `COSIGN_PRIVATE_KEY` | Optional | Sigstore Cosign private key for image signing |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Optional | OpenTelemetry collector endpoint (tracing opt-in) |
 | `ADMIN_PASSWORD` | Optional | Password for the seeded admin account |
-
----
-
-## Local Demo Mode Strategy (Planned)
-
-Because the platform depends on institutional OAuth and a dedicated runner VM, a `LOCAL_DEMO_MODE=true` environment variable is planned to make the platform fully evaluable offline:
-
-- **Mock authentication** — When `LOCAL_DEMO_MODE=true`, the NextAuth configuration adds a `CredentialsProvider` that accepts a hardcoded `demo@visscan.local` / `demo` login and injects a pre-seeded admin session, completely bypassing CMU EntraID. The existing `CredentialsProvider` + `bcryptjs` infrastructure is already in place in `lib/auth.ts`.
-
-- **Mock pipeline trigger** — In `worker/index.ts`, `triggerGitLab()` is extracted as a swappable function. In demo mode it returns a fake `pipelineId` immediately and inserts a pre-scripted sequence of status updates (QUEUED → RUNNING → security_audit → build → SUCCESS) into the database on a timer, simulating real pipeline progression without touching GitLab.
-
-- **Mock webhook delivery** — The status poller in demo mode reads from a local fixture file (`/demo/mock-reports/`) containing pre-generated `trivy-report.json`, `semgrep-report.json`, and `gitleaks-report.json` payloads, and calls the webhook handler directly (in-process) instead of waiting for CI callbacks.
-
-- **Pre-seeded demo data** — The `prisma/seed.ts` script is extended to populate a demo user, two sample projects, and a set of completed scan records with realistic finding counts, so the dashboard, history, and comparison views are all populated on first launch.
 
 ---
 

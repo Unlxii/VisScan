@@ -1,0 +1,59 @@
+# ============================================================
+#  VisScan — Dockerfile (Local Demo Mode)
+#  ใช้ NODE_ENV=development เพื่อ enable Credentials login
+#  และ bypass CMU EntraID OAuth
+# ============================================================
+
+FROM node:20-alpine AS base
+RUN apk add --no-cache libc6-compat python3 make g++
+
+# ─── Install Dependencies ─────────────────────────────────
+FROM base AS deps
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# ─── Build ───────────────────────────────────────────────
+FROM base AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+# Generate prisma client
+RUN npx prisma generate
+
+# Disable telemetry
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV SKIP_ENV_VALIDATION=1
+
+# Build Next.js in development mode (standalone output still works)
+RUN npm run build
+
+# ─── Runtime ─────────────────────────────────────────────
+FROM base AS runner
+WORKDIR /app
+
+# Run as development so CredentialsProvider allows all users
+ENV NODE_ENV=development
+ENV NEXT_TELEMETRY_DISABLED=1
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+
+RUN mkdir .next
+RUN chown nextjs:nodejs .next
+
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/package.json ./package.json
+
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+CMD ["node", "server.js"]
